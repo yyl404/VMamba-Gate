@@ -834,6 +834,60 @@ def selective_scan_torch(
     return out if oflex else out.to(dtype=dtype_in)
 
 
+def selective_scan_gate_torch(
+    u: torch.Tensor, # (B, K * C, L)
+    delta: torch.Tensor, # (B, K * C, L)
+    A: torch.Tensor, # (K * C, N)
+    B: torch.Tensor, # (B, K, N, L)
+    C: torch.Tensor, # (B, K, N, L)
+    D: torch.Tensor = None, # (K * C)
+    W_r: torch.Tensor = None, # (K * C, K * C * 2, N)
+    W_z: torch.Tensor = None, # (K * C, K * C * 2, N)
+    delta_bias: torch.Tensor = None, # (K * C)
+    delta_softplus=True, 
+    oflex=True, 
+    *args,
+    **kwargs
+):
+    dtype_in = u.dtype
+    Batch, K, N, L = B.shape
+    KCdim = u.shape[1]
+    Cdim = int(KCdim / K)
+    assert u.shape == (Batch, KCdim, L)
+    assert delta.shape == (Batch, KCdim, L)
+    assert A.shape == (KCdim, N)
+    assert C.shape == B.shape
+
+    if delta_bias is not None:
+        delta = delta + delta_bias[..., None]
+    if delta_softplus:
+        delta = torch.nn.functional.softplus(delta)
+            
+    u, delta, A, B, C = u.float(), delta.float(), A.float(), B.float(), C.float()
+    B = B.view(Batch, K, 1, N, L).repeat(1, 1, Cdim, 1, 1).view(Batch, KCdim, N, L)
+    C = C.view(Batch, K, 1, N, L).repeat(1, 1, Cdim, 1, 1).view(Batch, KCdim, N, L)
+    deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
+    deltaB_u = torch.einsum('bdl,bdnl,bdl->bdln', delta, B, u)
+    
+    if True:
+        x = A.new_zeros((Batch, KCdim, N))
+        ys = []
+        for i in range(L):
+            ux = torch.concat((u[:, :, None, i].repeat(1, 1, N), x), dim=2) # (Batch, 2*KCdim, N)
+            r = F.sigmoid(torch.einsum('dcn,bcn->bdn', W_r, ux)) # (Batch, KCdim, N)
+            z = F.sigmoid(torch.einsum('dcn,bcn->bdn', W_z, ux)) # (Batch, KCdim, N)
+            x_up = deltaA[:, : ,i, :] * r * x + deltaB_u[:, :, i, :] # (Batch, KCdim, N)
+            # x_up = deltaA[:, :, i, :] * x + deltaB_u_i[:, :, :] # (Batch, KCdim, N)
+            x = (1 - z) * x + z * x_up # (Batch, KCdim, N)
+            # x = x_up # (Batch, KCdim, N)
+            y = torch.einsum('bdn,bdn->bd', x, C[:, :, :, i])
+            ys.append(y)
+        y = torch.stack(ys, dim=2) # (B, C, L)
+    
+    out = y if D is None else y + u * D.unsqueeze(-1)
+    return out if oflex else out.to(dtype=dtype_in)
+
+
 class SelectiveScanCuda(torch.autograd.Function):
     @staticmethod
     @torch.cuda.amp.custom_fwd
@@ -881,7 +935,7 @@ def selective_scan_fn(
     oflex=True,
     backend=None,
 ):
-    fn = selective_scan_torch if backend == "torch" or (not WITH_SELECTIVESCAN_MAMBA) else SelectiveScanCuda.apply
+    fn = selective_scan_gate_torch if backend == "torch" or (not WITH_SELECTIVESCAN_MAMBA) else SelectiveScanCuda.apply
     return fn(u, delta, A, B, C, D, delta_bias, delta_softplus, oflex, backend)
 
 
