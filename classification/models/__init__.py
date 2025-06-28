@@ -40,6 +40,8 @@ def build_vssm_model(config, **kwargs):
             # ===================
             posembed=config.MODEL.VSSM.POSEMBED,
             imgsize=config.DATA.IMG_SIZE,
+            # ===================
+            gate=config.MODEL.VSSM.GATE,
         )
         return model
 

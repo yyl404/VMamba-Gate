@@ -108,7 +108,7 @@ def selective_scan_gate_torch(
         x = A.new_zeros((Batch, KCdim, N))
         ys = []
         for i in range(L):
-            ux = torch.concat((u[:, :, None, i].repeat(1, 1, N), x), dim=2) # (Batch, 2*KCdim, N)
+            ux = torch.concat((u[:, :, None, i].repeat(1, 1, N), x), dim=1) # (Batch, 2*KCdim, N)
             r = F.sigmoid(torch.einsum('dcn,bcn->bdn', W_r, ux)) # (Batch, KCdim, N)
             z = F.sigmoid(torch.einsum('dcn,bcn->bdn', W_z, ux)) # (Batch, KCdim, N)
             x_up = deltaA[:, : ,i, :] * r * x + deltaB_u[:, :, i, :] # (Batch, KCdim, N)
@@ -178,8 +178,27 @@ def selective_scan_fn(
 ):
     WITH_CUDA = (WITH_SELECTIVESCAN_OFLEX or WITH_SELECTIVESCAN_CORE or WITH_SELECTIVESCAN_MAMBA)
     # fn = selective_scan_torch if backend == "torch" or (not WITH_CUDA) else SelectiveScanCuda.apply
-    fn = selective_scan_gate_torch if backend == "torch" or (not WITH_CUDA) else SelectiveScanCuda.apply
+    fn = selective_scan_torch
+    # fn = selective_scan_torch if backend == "torch" or (not WITH_CUDA) else SelectiveScanCuda.apply
     return fn(u, delta, A, B, C, D, delta_bias, delta_softplus, oflex, backend)
+
+
+def selective_scan_gate_fn(
+    u: torch.Tensor, # (B, K * C, L)
+    delta: torch.Tensor, # (B, K * C, L)
+    A: torch.Tensor, # (K * C, N)
+    B: torch.Tensor, # (B, K, N, L)
+    C: torch.Tensor, # (B, K, N, L)
+    D: torch.Tensor = None, # (K * C)
+    W_r: torch.Tensor = None, # (K * C, K * C * 2, N)
+    W_z: torch.Tensor = None, # (K * C, K * C * 2, N)
+    delta_bias: torch.Tensor = None, # (K * C)
+    delta_softplus=True, 
+    oflex=True,
+    backend=None,
+):
+    fn = selective_scan_gate_torch
+    return fn(u, delta, A, B, C, D, W_r, W_z, delta_bias, delta_softplus, oflex, backend)
 
 
 # fvcore flops =======================================

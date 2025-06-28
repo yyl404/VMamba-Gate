@@ -873,7 +873,7 @@ def selective_scan_gate_torch(
         x = A.new_zeros((Batch, KCdim, N))
         ys = []
         for i in range(L):
-            ux = torch.concat((u[:, :, None, i].repeat(1, 1, N), x), dim=2) # (Batch, 2*KCdim, N)
+            ux = torch.concat((u[:, :, None, i].repeat(1, 1, N), x), dim=1) # (Batch, 2*KCdim, N)
             r = F.sigmoid(torch.einsum('dcn,bcn->bdn', W_r, ux)) # (Batch, KCdim, N)
             z = F.sigmoid(torch.einsum('dcn,bcn->bdn', W_z, ux)) # (Batch, KCdim, N)
             x_up = deltaA[:, : ,i, :] * r * x + deltaB_u[:, :, i, :] # (Batch, KCdim, N)
@@ -935,8 +935,29 @@ def selective_scan_fn(
     oflex=True,
     backend=None,
 ):
-    fn = selective_scan_gate_torch if backend == "torch" or (not WITH_SELECTIVESCAN_MAMBA) else SelectiveScanCuda.apply
+    fn = selective_scan_torch if backend == "torch" or (not WITH_SELECTIVESCAN_MAMBA) else SelectiveScanCuda.apply
     return fn(u, delta, A, B, C, D, delta_bias, delta_softplus, oflex, backend)
+
+
+def selective_scan_gate_fn(
+    u: torch.Tensor, # (B, K * C, L)
+    delta: torch.Tensor, # (B, K * C, L)
+    A: torch.Tensor, # (K * C, N)
+    B: torch.Tensor, # (B, K, N, L)
+    C: torch.Tensor, # (B, K, N, L)
+    D: torch.Tensor = None, # (K * C)
+    W_r: torch.Tensor = None, # (K * C, K * C * 2, N)
+    W_z: torch.Tensor = None, # (K * C, K * C * 2, N)
+    delta_bias: torch.Tensor = None, # (K * C)
+    delta_softplus=True, 
+    oflex=True,
+    backend=None,
+):
+    if backend == "torch" or (not WITH_SELECTIVESCAN_MAMBA):
+        fn = selective_scan_gate_torch
+    else:
+        raise NotImplementedError("selective_scan_gate_fn is not implemented for CUDA backend")
+    return fn(u, delta, A, B, C, D, W_r, W_z, delta_bias, delta_softplus, oflex, backend)
 
 
 # fvcore flops =======================================
@@ -1305,6 +1326,8 @@ class SS2Dv0:
         # ======================
         seq=False,
         force_fp32=True,
+        # ======================
+        gate=False,
         **kwargs,
     ):
         if "channel_first" in kwargs:
@@ -1361,6 +1384,12 @@ class SS2Dv0:
         self.out_proj = nn.Linear(d_inner, d_model, bias=bias)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else nn.Identity()
 
+        # Gate Weights ============================
+        self.gate = gate
+        if gate:
+            self.W_r = nn.Parameter(torch.randn(k_group * d_inner, k_group * d_inner * 2, d_state))
+            self.W_z = nn.Parameter(torch.randn(k_group * d_inner, k_group * d_inner * 2, d_state))
+
     def forwardv0(self, x: torch.Tensor, seq=False, force_fp32=True, **kwargs):
         x = self.in_proj(x)
         x, z = x.chunk(2, dim=-1) # (b, h, w, d)
@@ -1368,7 +1397,7 @@ class SS2Dv0:
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.conv2d(x) # (b, d, h, w)
         x = self.act(x)
-        selective_scan = partial(selective_scan_fn, backend="mamba")
+        selective_scan = partial(selective_scan_fn, backend="mamba") if not self.gate else partial(selective_scan_gate_fn, backend="torch")
         
         B, D, H, W = x.shape
         D, N = self.A_logs.shape
@@ -1401,23 +1430,35 @@ class SS2Dv0:
             xs, dts, Bs, Cs = to_fp32(xs, dts, Bs, Cs)
 
         if seq:
-            out_y = []
-            for i in range(4):
-                yi = selective_scan(
-                    xs.view(B, K, -1, L)[:, i], dts.view(B, K, -1, L)[:, i], 
-                    As.view(K, -1, N)[i], Bs[:, i].unsqueeze(1), Cs[:, i].unsqueeze(1), Ds.view(K, -1)[i],
-                    delta_bias=dt_projs_bias.view(K, -1)[i],
-                    delta_softplus=True,
-                ).view(B, -1, L)
-                out_y.append(yi)
-            out_y = torch.stack(out_y, dim=1)
+            if self.gate:
+                raise NotImplementedError("seq mode is not supported for gate version")
+            else:
+                out_y = []
+                for i in range(4):
+                    yi = selective_scan(
+                        xs.view(B, K, -1, L)[:, i], dts.view(B, K, -1, L)[:, i], 
+                        As.view(K, -1, N)[i], Bs[:, i].unsqueeze(1), Cs[:, i].unsqueeze(1), Ds.view(K, -1)[i],
+                        delta_bias=dt_projs_bias.view(K, -1)[i],
+                        delta_softplus=True,
+                    ).view(B, -1, L)
+                    out_y.append(yi)
+                out_y = torch.stack(out_y, dim=1)
         else:
-            out_y = selective_scan(
-                xs, dts, 
-                As, Bs, Cs, Ds,
-                delta_bias=dt_projs_bias,
-                delta_softplus=True,
-            ).view(B, K, -1, L)
+            if self.gate:
+                out_y = selective_scan(
+                    xs, dts, 
+                    As, Bs, Cs, Ds,
+                    self.W_r, self.W_z,
+                    delta_bias=dt_projs_bias,
+                    delta_softplus=True,
+                ).view(B, K, -1, L)
+            else:
+                out_y = selective_scan(
+                    xs, dts, 
+                    As, Bs, Cs, Ds,
+                    delta_bias=dt_projs_bias,
+                    delta_softplus=True,
+                ).view(B, K, -1, L)
         assert out_y.dtype == torch.float
 
         inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
@@ -1462,6 +1503,7 @@ class SS2Dv2:
         forward_type="v2",
         channel_first=False,
         # ======================
+        gate=False,
         **kwargs,    
     ):
         factory_kwargs = {"device": None, "dtype": None}
@@ -1554,6 +1596,11 @@ class SS2Dv2:
         # self.dt_projs.bias.data = self.dt_projs_bias.data.view(self.dt_projs.bias.shape)
         del self.dt_projs_weight
         # del self.dt_projs_bias
+        # Gate Weights ============================
+        self.gate = gate
+        if gate:
+            self.W_r = nn.Parameter(torch.randn(self.k_group * self.d_inner, self.k_group * self.d_inner * 2, d_state))
+            self.W_z = nn.Parameter(torch.randn(self.k_group * self.d_inner, self.k_group * self.d_inner * 2, d_state))
 
     def forward_corev2(
         self,
@@ -1583,8 +1630,11 @@ class SS2Dv2:
         K, D, R = self.k_group, self.d_inner, self.dt_rank
         L = H * W
 
-        def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True):
-            return selective_scan_fn(u, delta, A, B, C, D, delta_bias, delta_softplus, ssoflex, backend=selective_scan_backend)
+        def selective_scan(u, delta, A, B, C, D=None, W_r=None, W_z=None, delta_bias=None, delta_softplus=True):
+            if self.gate:
+                return selective_scan_gate_fn(u, delta, A, B, C, D, W_r, W_z, delta_bias, delta_softplus, ssoflex, backend="torch")
+            else:
+                return selective_scan_fn(u, delta, A, B, C, D, delta_bias, delta_softplus, ssoflex, backend=selective_scan_backend)
         
         if True:
             xs = cross_scan_fn(x, in_channel_first=True, out_channel_first=True, scans=_scan_mode, force_torch=scan_force_torch)
@@ -1604,9 +1654,14 @@ class SS2Dv2:
             if force_fp32:
                 xs, dts, Bs, Cs = to_fp32(xs, dts, Bs, Cs)
 
-            ys: torch.Tensor = selective_scan(
-                xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
-            ).view(B, K, -1, H, W)
+            if self.gate:
+                ys: torch.Tensor = selective_scan(
+                    xs, dts, As, Bs, Cs, Ds, self.W_r, self.W_z, delta_bias, delta_softplus
+                ).view(B, K, -1, H, W)
+            else:
+                ys: torch.Tensor = selective_scan(
+                    xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
+                ).view(B, K, -1, H, W)
             
             y: torch.Tensor = cross_merge_fn(ys, in_channel_first=True, out_channel_first=True, scans=_scan_mode, force_torch=scan_force_torch)
 
@@ -1715,6 +1770,7 @@ class SS2D(nn.Module, SS2Dv0, SS2Dv2):
         forward_type="v2",
         channel_first=False,
         # ======================
+        gate=False,
         **kwargs,
     ):
         nn.Module.__init__(self)
@@ -1725,13 +1781,17 @@ class SS2D(nn.Module, SS2Dv0, SS2Dv2):
             initialize=initialize, forward_type=forward_type, channel_first=channel_first,
         )
         if forward_type in ["v0", "v0seq"]:
-            self.__initv0__(seq=("seq" in forward_type), **kwargs)
+            self.__initv0__(seq=("seq" in forward_type), gate=gate, **kwargs)
         elif forward_type.startswith("xv"):
+            if gate:
+                raise NotImplementedError("gate version is not supported for xv")
             self.__initxv__(**kwargs)
         elif forward_type.startswith("m"):
+            if gate:
+                raise NotImplementedError("gate version is not supported for m")
             self.__initm0__(**kwargs)
         else:
-            self.__initv2__(**kwargs)
+            self.__initv2__(gate=gate, **kwargs)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         self_state_dict = self.state_dict()
@@ -1776,6 +1836,7 @@ class VSSBlock(nn.Module):
         use_checkpoint: bool = False,
         post_norm: bool = False,
         # =============================
+        gate=False,
         **kwargs,
     ):
         super().__init__()
@@ -1808,6 +1869,7 @@ class VSSBlock(nn.Module):
                 # ==========================
                 forward_type=forward_type,
                 channel_first=channel_first,
+                gate=gate
             )
         
         self.drop_path = DropPath(drop_path)
@@ -1874,6 +1936,7 @@ class VSSM(nn.Module):
         imgsize=224,
         _SS2D=SS2D,
         # =========================
+        gate=False,
         **kwargs,
     ):
         super().__init__()
@@ -1930,6 +1993,7 @@ class VSSM(nn.Module):
                 gmlp=gmlp,
                 # =================
                 _SS2D=_SS2D,
+                gate=gate
             ))
 
         self.classifier = nn.Sequential(OrderedDict(
@@ -2048,6 +2112,7 @@ class VSSM(nn.Module):
         mlp_act_layer=nn.GELU,
         mlp_drop_rate=0.0,
         # ===========================
+        gate=False,
         **kwargs,
     ):
         # if channel first, then Norm and Output are both channel_first
@@ -2071,6 +2136,7 @@ class VSSM(nn.Module):
                 mlp_act_layer=mlp_act_layer,
                 mlp_drop_rate=mlp_drop_rate,
                 use_checkpoint=use_checkpoint,
+                gate=gate
             ))
         
         return nn.Sequential(OrderedDict(
@@ -2229,7 +2295,7 @@ def vmamba(**kwargs):
 
 
 @register_model
-def vanilla_vmamba_tiny(pretrained=False, **kwargs):
+def vanilla_vmamba_tiny(pretrained=False, gate=False, **kwargs):
     model = VSSM(
         depths=[2, 2, 9, 2], dims=96, drop_path_rate=0.2, 
         patch_size=4, in_chans=3, num_classes=1000, 
@@ -2240,14 +2306,15 @@ def vanilla_vmamba_tiny(pretrained=False, **kwargs):
         patch_norm=True, norm_layer="ln", 
         downsample_version="v1", patchembed_version="v1", 
         use_checkpoint=False, posembed=False, imgsize=224, 
+        gate=gate
     )
     if pretrained:
-        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v0cls/vssmtiny_dp01_ckpt_epoch_292.pth"))
+        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v0cls/vssmtiny_dp01_ckpt_epoch_292.pth"), strict=False)
     return model
 
 
 @register_model
-def vanilla_vmamba_small(pretrained=False, **kwargs):
+def vanilla_vmamba_small(pretrained=False, gate=False, **kwargs):
     model = VSSM(
         depths=[2, 2, 27, 2], dims=96, drop_path_rate=0.3, 
         patch_size=4, in_chans=3, num_classes=1000, 
@@ -2258,14 +2325,15 @@ def vanilla_vmamba_small(pretrained=False, **kwargs):
         patch_norm=True, norm_layer="ln", 
         downsample_version="v1", patchembed_version="v1", 
         use_checkpoint=False, posembed=False, imgsize=224, 
+        gate=gate
     )
     if pretrained:
-        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v0cls/vssmsmall_dp03_ckpt_epoch_238.pth"))
+        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v0cls/vssmsmall_dp03_ckpt_epoch_238.pth"), strict=False)
     return model
 
 
 @register_model
-def vanilla_vmamba_base(pretrained=False, **kwargs):
+def vanilla_vmamba_base(pretrained=False, gate=False, **kwargs):
     model = VSSM(
         depths=[2, 2, 27, 2], dims=128, drop_path_rate=0.6, 
         patch_size=4, in_chans=3, num_classes=1000, 
@@ -2276,14 +2344,15 @@ def vanilla_vmamba_base(pretrained=False, **kwargs):
         patch_norm=True, norm_layer="ln", 
         downsample_version="v1", patchembed_version="v1", 
         use_checkpoint=False, posembed=False, imgsize=224, 
+        gate=gate
     )
     if pretrained:
-        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v0cls/vssmbase_dp06_ckpt_epoch_241.pth"))
+        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v0cls/vssmbase_dp06_ckpt_epoch_241.pth"), strict=False)
     return model
 
 
 @register_model
-def vmamba_tiny_s2l5(pretrained=False, channel_first=True, **kwargs):
+def vmamba_tiny_s2l5(pretrained=False, channel_first=True, gate=False, **kwargs):
     model = VSSM(
         depths=[2, 2, 5, 2], dims=96, drop_path_rate=0.2, 
         patch_size=4, in_chans=3, num_classes=1000, 
@@ -2294,14 +2363,15 @@ def vmamba_tiny_s2l5(pretrained=False, channel_first=True, **kwargs):
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
+        gate=gate
     )
     if pretrained:
-        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm_tiny_0230_ckpt_epoch_262.pth"))
+        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm_tiny_0230_ckpt_epoch_262.pth"), strict=False)
     return model
 
 
 @register_model
-def vmamba_small_s2l15(pretrained=False, channel_first=True, **kwargs):
+def vmamba_small_s2l15(pretrained=False, channel_first=True, gate=False, **kwargs):
     model = VSSM(
         depths=[2, 2, 15, 2], dims=96, drop_path_rate=0.3, 
         patch_size=4, in_chans=3, num_classes=1000, 
@@ -2312,14 +2382,15 @@ def vmamba_small_s2l15(pretrained=False, channel_first=True, **kwargs):
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
+        gate=gate
     )
     if pretrained:
-        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm_small_0229_ckpt_epoch_222.pth"))
+        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm_small_0229_ckpt_epoch_222.pth"), strict=False)
     return model
 
 
 @register_model
-def vmamba_base_s2l15(pretrained=False, channel_first=True, **kwargs):
+def vmamba_base_s2l15(pretrained=False, channel_first=True, gate=False, **kwargs):
     model = VSSM(
         depths=[2, 2, 15, 2], dims=128, drop_path_rate=0.6, 
         patch_size=4, in_chans=3, num_classes=1000, 
@@ -2330,14 +2401,15 @@ def vmamba_base_s2l15(pretrained=False, channel_first=True, **kwargs):
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
+        gate=gate
     )
     if pretrained:
-        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm_base_0229_ckpt_epoch_237.pth"))
+        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm_base_0229_ckpt_epoch_237.pth"), strict=False)
     return model
 
 
 @register_model
-def vmamba_tiny_s1l8(pretrained=False, channel_first=True, **kwargs):
+def vmamba_tiny_s1l8(pretrained=False, channel_first=True, gate=False, **kwargs):
     model = VSSM(
         depths=[2, 2, 8, 2], dims=96, drop_path_rate=0.2, 
         patch_size=4, in_chans=3, num_classes=1000, 
@@ -2348,14 +2420,15 @@ def vmamba_tiny_s1l8(pretrained=False, channel_first=True, **kwargs):
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
+        gate=gate
     )
     if pretrained:
-        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm1_tiny_0230s_ckpt_epoch_264.pth"))
+        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm1_tiny_0230s_ckpt_epoch_264.pth"), strict=False)
     return model
 
 
 @register_model
-def vmamba_small_s1l20(pretrained=False, channel_first=True, **kwargs):
+def vmamba_small_s1l20(pretrained=False, channel_first=True, gate=False, **kwargs):
     model = VSSM(
         depths=[2, 2, 20, 2], dims=96, drop_path_rate=0.3, 
         patch_size=4, in_chans=3, num_classes=1000, 
@@ -2366,14 +2439,15 @@ def vmamba_small_s1l20(pretrained=False, channel_first=True, **kwargs):
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
+        gate=gate
     )
     if pretrained:
-        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm1_small_0229s_ckpt_epoch_240.pth"))
+        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm1_small_0229s_ckpt_epoch_240.pth"), strict=False)
     return model
 
 
 @register_model
-def vmamba_base_s1l20(pretrained=False, channel_first=True, **kwargs):
+def vmamba_base_s1l20(pretrained=False, channel_first=True, gate=False, **kwargs):
     model = VSSM(
         depths=[2, 2, 20, 2], dims=128, drop_path_rate=0.5, 
         patch_size=4, in_chans=3, num_classes=1000, 
@@ -2384,9 +2458,10 @@ def vmamba_base_s1l20(pretrained=False, channel_first=True, **kwargs):
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
+        gate=gate
     )
     if pretrained:
-        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm1_base_0229s_ckpt_epoch_225.pth"))
+        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm1_base_0229s_ckpt_epoch_225.pth"), strict=False)
     return model
 
 
@@ -2487,26 +2562,26 @@ def throughput(data_loader, model):
         return
 
 
-def do_validate(name="vmamba_tiny_s1l8", data="/media/memfs/ImageNet_ILSVRC2012/val"):
+def do_validate(name="vmamba_tiny_s1l8", data="/root/data/ILSVRC2012/val_image_folder"):
     from timm import create_model
     if True:
         torch.backends.cudnn.enabled = True
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = True
     data_loader_val = get_val_loader(batch_size=64, root=data, num_workers=4)
-    model = create_model(name, pretrained=True)
+    model = create_model(name, pretrained=True, gate=True)
     acc1_ema, acc5_ema, loss_ema = validate(data_loader_val, model)
     print(acc1_ema, acc5_ema, loss_ema)
 
 
-def do_throughput(name="vmamba_tiny_s1l8", data="/media/memfs/ImageNet_ILSVRC2012/val"):
+def do_throughput(name="vmamba_tiny_s1l8", data="/root/data/ILSVRC2012/val_image_folder"):
     from timm import create_model
     if True:
         torch.backends.cudnn.enabled = True
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = True
     data_loader_val = get_val_loader(batch_size=128, root=data, num_workers=4)
-    model = create_model(name, pretrained=True)
+    model = create_model(name, pretrained=True, gate=False)
     throughput(data_loader_val, model)
 
 

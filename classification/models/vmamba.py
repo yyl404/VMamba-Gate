@@ -25,9 +25,9 @@ except:
     from csm_triton import cross_scan_fn, cross_merge_fn
 
 try:
-    from .csms6s import selective_scan_fn, selective_scan_flop_jit
+    from .csms6s import selective_scan_fn, selective_scan_gate_fn, selective_scan_flop_jit
 except:
-    from csms6s import selective_scan_fn, selective_scan_flop_jit
+    from csms6s import selective_scan_fn, selective_scan_gate_fn, selective_scan_flop_jit
 
 # FLOPs counter not prepared fro mamba2
 try:
@@ -246,6 +246,8 @@ class SS2Dv0:
         # ======================
         seq=False,
         force_fp32=True,
+        # ======================
+        gate=False,
         **kwargs,
     ):
         if "channel_first" in kwargs:
@@ -301,6 +303,11 @@ class SS2Dv0:
         self.out_norm = nn.LayerNorm(d_inner)
         self.out_proj = nn.Linear(d_inner, d_model, bias=bias)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else nn.Identity()
+        # Gate Weights ============================
+        self.gate = gate
+        if gate:
+            self.W_r = nn.Parameter(torch.randn(k_group * d_inner, k_group * d_inner * 2, d_state))
+            self.W_z = nn.Parameter(torch.randn(k_group * d_inner, k_group * d_inner * 2, d_state))
 
     def forwardv0(self, x: torch.Tensor, seq=False, force_fp32=True, **kwargs):
         x = self.in_proj(x)
@@ -309,7 +316,7 @@ class SS2Dv0:
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.conv2d(x) # (b, d, h, w)
         x = self.act(x)
-        selective_scan = partial(selective_scan_fn, backend="mamba")
+        selective_scan = partial(selective_scan_fn, backend="mamba") if not self.gate else partial(selective_scan_gate_fn, backend="torch")
         
         B, D, H, W = x.shape
         D, N = self.A_logs.shape
@@ -342,23 +349,35 @@ class SS2Dv0:
             xs, dts, Bs, Cs = to_fp32(xs, dts, Bs, Cs)
 
         if seq:
-            out_y = []
-            for i in range(4):
-                yi = selective_scan(
-                    xs.view(B, K, -1, L)[:, i], dts.view(B, K, -1, L)[:, i], 
-                    As.view(K, -1, N)[i], Bs[:, i].unsqueeze(1), Cs[:, i].unsqueeze(1), Ds.view(K, -1)[i],
-                    delta_bias=dt_projs_bias.view(K, -1)[i],
-                    delta_softplus=True,
-                ).view(B, -1, L)
-                out_y.append(yi)
-            out_y = torch.stack(out_y, dim=1)
+            if self.gate:
+                raise NotImplementedError("seq mode is not supported for gate version")
+            else:
+                out_y = []
+                for i in range(4):
+                    yi = selective_scan(
+                        xs.view(B, K, -1, L)[:, i], dts.view(B, K, -1, L)[:, i], 
+                        As.view(K, -1, N)[i], Bs[:, i].unsqueeze(1), Cs[:, i].unsqueeze(1), Ds.view(K, -1)[i],
+                        delta_bias=dt_projs_bias.view(K, -1)[i],
+                        delta_softplus=True,
+                    ).view(B, -1, L)
+                    out_y.append(yi)
+                out_y = torch.stack(out_y, dim=1)
         else:
-            out_y = selective_scan(
-                xs, dts, 
-                As, Bs, Cs, Ds,
-                delta_bias=dt_projs_bias,
-                delta_softplus=True,
-            ).view(B, K, -1, L)
+            if self.gate:
+                out_y = selective_scan(
+                    xs, dts, 
+                    As, Bs, Cs, Ds,
+                    self.W_r, self.W_z,
+                    delta_bias=dt_projs_bias,
+                    delta_softplus=True,
+                ).view(B, K, -1, L)
+            else:
+                out_y = selective_scan(
+                    xs, dts, 
+                    As, Bs, Cs, Ds,
+                    delta_bias=dt_projs_bias,
+                    delta_softplus=True,
+                ).view(B, K, -1, L)
         assert out_y.dtype == torch.float
 
         inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
@@ -403,6 +422,7 @@ class SS2Dv2:
         forward_type="v2",
         channel_first=False,
         # ======================
+        gate=False,
         **kwargs,    
     ):
         factory_kwargs = {"device": None, "dtype": None}
@@ -489,6 +509,11 @@ class SS2Dv2:
             self.A_logs = nn.Parameter(torch.zeros((self.k_group * self.d_inner, self.d_state))) # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
             self.dt_projs_weight = nn.Parameter(0.1 * torch.rand((self.k_group, self.d_inner, self.dt_rank)))
             self.dt_projs_bias = nn.Parameter(0.1 * torch.rand((self.k_group, self.d_inner)))
+        # Gate Weights ============================
+        self.gate = gate
+        if gate:
+            self.W_r = nn.Parameter(torch.randn(self.k_group * self.d_inner, self.k_group * self.d_inner * 2, d_state))
+            self.W_z = nn.Parameter(torch.randn(self.k_group * self.d_inner, self.k_group * self.d_inner * 2, d_state))
 
     def forward_corev2(
         self,
@@ -506,6 +531,7 @@ class SS2Dv2:
         # ==============================
         **kwargs,
     ):
+        
         assert selective_scan_backend in [None, "oflex", "mamba", "torch"]
         _scan_mode = dict(cross2d=0, unidi=1, bidi=2, cascade2d=-1).get(scan_mode, None) if isinstance(scan_mode, str) else scan_mode # for debug
         assert isinstance(_scan_mode, int)
@@ -519,8 +545,11 @@ class SS2Dv2:
         K, D, R = self.k_group, self.d_inner, self.dt_rank
         L = H * W
 
-        def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True):
-            return selective_scan_fn(u, delta, A, B, C, D, delta_bias, delta_softplus, ssoflex, backend=selective_scan_backend)
+        def selective_scan(u, delta, A, B, C, D=None, W_r=None, W_z=None, delta_bias=None, delta_softplus=True):
+            if self.gate:
+                return selective_scan_gate_fn(u, delta, A, B, C, D, W_r, W_z, delta_bias, delta_softplus, ssoflex, backend="torch")
+            else:
+                return selective_scan_fn(u, delta, A, B, C, D, delta_bias, delta_softplus, ssoflex, backend=selective_scan_backend)
         
         if _scan_mode == -1:
             x_proj_bias = getattr(self, "x_proj_bias", None)
@@ -625,9 +654,14 @@ class SS2Dv2:
             if force_fp32:
                 xs, dts, Bs, Cs = to_fp32(xs, dts, Bs, Cs)
 
-            ys: torch.Tensor = selective_scan(
-                xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
-            ).view(B, K, -1, H, W)
+            if self.gate:
+                ys: torch.Tensor = selective_scan(
+                    xs, dts, As, Bs, Cs, Ds, self.W_r, self.W_z, delta_bias, delta_softplus
+                ).view(B, K, -1, H, W)
+            else:
+                ys: torch.Tensor = selective_scan(
+                    xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
+                ).view(B, K, -1, H, W)
             
             y: torch.Tensor = cross_merge_fn(ys, in_channel_first=True, out_channel_first=True, scans=_scan_mode, force_torch=scan_force_torch)
 
@@ -739,6 +773,7 @@ class SS2Dv3:
         forward_type="v2",
         channel_first=False,
         # ======================
+        gate=False,
         **kwargs,
     ):
         super().__init__()
@@ -833,6 +868,11 @@ class SS2Dv3:
             self.A_logs = nn.Parameter(torch.zeros((k_group * d_inner, d_state))) # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
             self.dt_projs_weight = nn.Parameter(0.1 * torch.rand((k_group, d_inner, dt_rank)))
             self.dt_projs_bias = nn.Parameter(0.1 * torch.rand((k_group, d_inner)))
+        # Gate Weights ============================
+        self.gate = gate
+        if gate:
+            self.W_r = nn.Parameter(torch.randn(k_group * d_inner, k_group * d_inner * 2, d_state))
+            self.W_z = nn.Parameter(torch.randn(k_group * d_inner, k_group * d_inner * 2, d_state))
 
 
         if forward_type.startswith("xv2"):
@@ -849,8 +889,11 @@ class SS2Dv3:
 
         to_fp32 = lambda *args: (_a.to(torch.float32) for _a in args)
 
-        def selective_scan(u, delta, A, B, C, D, delta_bias, delta_softplus):
-            return selective_scan_fn(u, delta, A, B, C, D, delta_bias, delta_softplus, oflex=True, backend=None)
+        def selective_scan(u, delta, A, B, C, D=None, W_r=None, W_z=None, delta_bias=None, delta_softplus=True):
+            if self.gate:
+                return selective_scan_gate_fn(u, delta, A, B, C, D, W_r, W_z, delta_bias, delta_softplus, ssoflex=True, backend="torch")
+            else:
+                return selective_scan_fn(u, delta, A, B, C, D, delta_bias, delta_softplus, ssoflex=True, backend=None)
 
         if self.iconv:
             x = self.cact(self.conv2d(x)) # (b, d, h, w)
@@ -883,9 +926,14 @@ class SS2Dv3:
         if force_fp32:
             us, dts, Bs, Cs = to_fp32(us, dts, Bs, Cs)
 
-        ys: torch.Tensor = selective_scan(
-            us, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
-        ).view(B, 4, -1, H, W)
+        if self.gate:
+            ys: torch.Tensor = selective_scan(
+                us, dts, As, Bs, Cs, Ds, self.W_r, self.W_z, delta_bias, delta_softplus
+            ).view(B, 4, -1, H, W)
+        else:
+            ys: torch.Tensor = selective_scan(
+                us, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
+            ).view(B, 4, -1, H, W)
         y: torch.Tensor = cross_merge_fn(ys.contiguous(), in_channel_first=self.channel_first, out_channel_first=True)
         y = y.view(B, -1, H, W) if self.channel_first else y.view(B, H, W, -1)
         y = out_norm(y)
@@ -939,6 +987,7 @@ class SS2Dm0:
         # ======================
         with_initial_state=False,
         # ======================
+        gate=False,
         **kwargs,    
     ):
         factory_kwargs = {"device": None, "dtype": None}
@@ -1014,6 +1063,11 @@ class SS2Dm0:
         self.initial_state = None
         if with_initial_state:
             self.initial_state = nn.Parameter(torch.zeros((1, k_group * dt_rank, int(d_inner // dt_rank), d_state)), requires_grad=False)
+        
+        # Gate Weights ============================
+        self.gate = gate
+        if gate:
+            raise NotImplementedError("Gate is not supported in m0 mode.")
 
     def forward_corem0(
         self,
@@ -1130,6 +1184,7 @@ class SS2D(nn.Module, SS2Dv0, SS2Dv2, SS2Dv3, SS2Dm0):
         forward_type="v2",
         channel_first=False,
         # ======================
+        gate=False,
         **kwargs,
     ):
         nn.Module.__init__(self)
@@ -1140,13 +1195,13 @@ class SS2D(nn.Module, SS2Dv0, SS2Dv2, SS2Dv3, SS2Dm0):
             initialize=initialize, forward_type=forward_type, channel_first=channel_first,
         )
         if forward_type in ["v0", "v0seq"]:
-            self.__initv0__(seq=("seq" in forward_type), **kwargs)
+            self.__initv0__(seq=("seq" in forward_type), gate=gate, **kwargs)
         elif forward_type.startswith("xv"):
-            self.__initxv__(**kwargs)
+            self.__initxv__(gate=gate, **kwargs)
         elif forward_type.startswith("m"):
-            self.__initm0__(**kwargs)
+            self.__initm0__(gate=gate, **kwargs)
         else:
-            self.__initv2__(**kwargs)
+            self.__initv2__(gate=gate, **kwargs)
 
 
 # =====================================================
@@ -1177,6 +1232,7 @@ class VSSBlock(nn.Module):
         post_norm: bool = False,
         # =============================
         _SS2D: type = SS2D,
+        gate=False,
         **kwargs,
     ):
         super().__init__()
@@ -1209,6 +1265,7 @@ class VSSBlock(nn.Module):
                 # ==========================
                 forward_type=forward_type,
                 channel_first=channel_first,
+                gate=gate,
             )
         
         self.drop_path = DropPath(drop_path)
@@ -1275,6 +1332,7 @@ class VSSM(nn.Module):
         imgsize=224,
         _SS2D=SS2D,
         # =========================
+        gate=False,
         **kwargs,
     ):
         super().__init__()
@@ -1352,6 +1410,7 @@ class VSSM(nn.Module):
                 gmlp=gmlp,
                 # =================
                 _SS2D=_SS2D,
+                gate=gate,
             ))
 
         self.classifier = nn.Sequential(OrderedDict(
@@ -1461,6 +1520,7 @@ class VSSM(nn.Module):
         gmlp=False,
         # ===========================
         _SS2D=SS2D,
+        gate=False,
         **kwargs,
     ):
         # if channel first, then Norm and Output are both channel_first
@@ -1487,6 +1547,7 @@ class VSSM(nn.Module):
                 gmlp=gmlp,
                 use_checkpoint=use_checkpoint,
                 _SS2D=_SS2D,
+                gate=gate,
             ))
         
         return nn.Sequential(OrderedDict(

@@ -15,6 +15,7 @@ import argparse
 import datetime
 import tqdm
 import numpy as np
+from tqdm import tqdm
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -39,6 +40,8 @@ from timm.utils import ModelEma as ModelEma
 if torch.multiprocessing.get_start_method() != "spawn":
     print(f"||{torch.multiprocessing.get_start_method()}||", end="")
     torch.multiprocessing.set_start_method("spawn", force=True)
+
+os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'DETAIL'
 
 def str2bool(v):
     """
@@ -135,7 +138,7 @@ def main(config, args):
 
 
     optimizer = build_optimizer(config, model, logger)
-    model = torch.nn.parallel.DistributedDataParallel(model, broadcast_buffers=False)
+    model = torch.nn.parallel.DistributedDataParallel(model, broadcast_buffers=False, find_unused_parameters=True)
     loss_scaler = NativeScalerWithGradNormCount()
 
     if config.TRAIN.ACCUMULATION_STEPS > 1:
@@ -237,6 +240,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
 
     start = time.time()
     end = time.time()
+    data_loader = tqdm(data_loader, desc=f"Train Epoch {epoch}:")
     for idx, (samples, targets) in enumerate(data_loader):
         torch.cuda.reset_peak_memory_stats()
         samples = samples.cuda(non_blocking=True)
@@ -276,21 +280,34 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         if idx > model_time_warmup:
             model_time.update(batch_time.val - data_time.val)
 
-        if idx % config.PRINT_FREQ == 0:
-            lr = optimizer.param_groups[0]['lr']
-            wd = optimizer.param_groups[0]['weight_decay']
-            memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
-            etas = batch_time.avg * (num_steps - idx)
-            logger.info(
-                f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
-                f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t wd {wd:.4f}\t'
-                f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
-                f'data time {data_time.val:.4f} ({data_time.avg:.4f})\t'
-                f'model time {model_time.val:.4f} ({model_time.avg:.4f})\t'
-                f'loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
-                f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
-                f'loss_scale {scaler_meter.val:.4f} ({scaler_meter.avg:.4f})\t'
-                f'mem {memory_used:.0f}MB')
+        lr = optimizer.param_groups[0]['lr']
+        wd = optimizer.param_groups[0]['weight_decay']
+        memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+        etas = batch_time.avg * (num_steps - idx)
+        data_loader.set_postfix_str(f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}] '
+            f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f} wd {wd:.4f} '
+            # f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
+            # f'data time {data_time.val:.4f} ({data_time.avg:.4f})\t'
+            # f'model time {model_time.val:.4f} ({model_time.avg:.4f})\t'
+            f'loss {loss_meter.val:.4f} ({loss_meter.avg:.4f}) '
+            f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f}) '
+            # f'loss_scale {scaler_meter.val:.4f} ({scaler_meter.avg:.4f})\t'
+            f'mem {memory_used:.0f}MB')
+        # if idx % config.PRINT_FREQ == 0:
+        #     lr = optimizer.param_groups[0]['lr']
+        #     wd = optimizer.param_groups[0]['weight_decay']
+        #     memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+        #     etas = batch_time.avg * (num_steps - idx)
+        #     logger.info(
+        #         f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
+        #         f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t wd {wd:.4f}\t'
+        #         f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
+        #         f'data time {data_time.val:.4f} ({data_time.avg:.4f})\t'
+        #         f'model time {model_time.val:.4f} ({model_time.avg:.4f})\t'
+        #         f'loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
+        #         f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
+        #         f'loss_scale {scaler_meter.val:.4f} ({scaler_meter.avg:.4f})\t'
+        #         f'mem {memory_used:.0f}MB')
     epoch_time = time.time() - start
     logger.info(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
 
