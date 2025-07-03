@@ -265,6 +265,8 @@ def update_config(config, args):
         config.AMP_ENABLE = False
     if _check_args('output'):
         config.OUTPUT = args.output
+    if _check_args('save_freq'):
+        config.SAVE_FREQ = args.save_freq
     if _check_args('tag'):
         config.TAG = args.tag
     if _check_args('eval'):

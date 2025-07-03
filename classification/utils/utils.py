@@ -82,7 +82,7 @@ def load_pretrained_ema(config, model, logger, model_ema: ModelEma=None):
     torch.cuda.empty_cache()
 
 
-def save_checkpoint_ema(config, epoch, model, max_accuracy, optimizer, lr_scheduler, loss_scaler, logger, model_ema: ModelEma=None, max_accuracy_ema=None):
+def save_checkpoint_ema(config, epoch, model, max_accuracy, optimizer, lr_scheduler, loss_scaler, logger, model_ema: ModelEma=None, max_accuracy_ema=None, filename=None):
     save_state = {'model': model.state_dict(),
                   'optimizer': optimizer.state_dict(),
                   'lr_scheduler': lr_scheduler.state_dict(),
@@ -93,9 +93,13 @@ def save_checkpoint_ema(config, epoch, model, max_accuracy, optimizer, lr_schedu
     
     if model_ema is not None:
         save_state.update({'model_ema': model_ema.ema.state_dict(),
-            'max_accuray_ema': max_accuracy_ema})
+            'max_accuracy_ema': max_accuracy_ema})
 
-    save_path = os.path.join(config.OUTPUT, f'ckpt_epoch_{epoch}.pth')
+    if filename is None:
+        save_path = os.path.join(config.OUTPUT, f'ckpt_epoch_{epoch}.pth')
+    else:
+        save_path = os.path.join(config.OUTPUT, filename)
+    
     logger.info(f"{save_path} saving......")
     torch.save(save_state, save_path)
     logger.info(f"{save_path} saved !!!")
